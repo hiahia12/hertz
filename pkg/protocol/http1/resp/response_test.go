@@ -57,6 +57,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/common/utils"
 	"github.com/cloudwego/hertz/pkg/protocol"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/cloudwego/hertz/pkg/protocol/http1/ext"
 	"github.com/cloudwego/netpoll"
 )
 
@@ -411,15 +412,16 @@ func TestResponseReadLimitBody(t *testing.T) {
 }
 
 func TestResponseReadWithoutBody(t *testing.T) {
-	t.Parallel()
-
 	var resp protocol.Response
 
 	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 304 Not Modified\r\nContent-Type: aa\r\nContent-Encoding: gzip\r\nContent-Length: 1235\r\n\r\n", false,
 		consts.StatusNotModified, 1235, "aa", nil, "gzip", consts.HTTP11)
 
-	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 204 Foo Bar\r\nContent-Type: aab\r\nTrailer: Foo\r\nContent-Encoding: deflate\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nFoo: bar\r\n\r\n", false,
-		consts.StatusNoContent, -1, "aab", map[string]string{"Foo": "bar"}, "deflate", consts.HTTP11)
+	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 200 Foo Bar\r\nContent-Type: aab\r\nTrailer: Foo\r\nContent-Encoding: deflate\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nFoo: bar\r\n\r\nHTTP/1.2", false,
+		consts.StatusOK, 0, "aab", map[string]string{"Foo": "bar"}, "deflate", consts.HTTP11)
+
+	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 204 Foo Bar\r\nContent-Type: aab\r\nTrailer: Foo\r\nContent-Encoding: deflate\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nFoo: bar\r\n\r\nHTTP/1.2", true,
+		consts.StatusNoContent, -1, "aab", nil, "deflate", consts.HTTP11)
 
 	testResponseReadWithoutBody(t, &resp, "HTTP/1.1 123 AAA\r\nContent-Type: xxx\r\nContent-Encoding: gzip\r\nContent-Length: 3434\r\n\r\n", false,
 		123, 3434, "xxx", nil, "gzip", consts.HTTP11)
@@ -524,6 +526,12 @@ func verifyResponseTrailer(t *testing.T, h *protocol.ResponseHeader, expectedTra
 			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", k, v, got)
 		}
 	}
+
+	h.Trailer().VisitAll(func(key, value []byte) {
+		if v := expectedTrailers[string(key)]; string(value) != v {
+			t.Fatalf("Unexpected trailer %q. Expected %q. Got %q", string(key), v, string(value))
+		}
+	})
 }
 
 func testResponseReadLimitBodyError(t *testing.T, s string, maxBodySize int) {
@@ -605,6 +613,27 @@ func testResponseBodyStreamWithTrailer(t *testing.T, body []byte, disableNormali
 			t.Fatalf("unexpected trailer header %q: %q. Expecting %s", kBytes, r, v)
 		}
 	}
+}
+
+func TestResponseReadBodyStreamBadReader(t *testing.T) {
+	t.Parallel()
+
+	resp := protocol.AcquireResponse()
+
+	errReader := mock.NewErrorReadConn(errors.New("test error"))
+
+	bodyBuf := resp.BodyBuffer()
+	bodyBuf.Reset()
+
+	bodyStream := ext.AcquireBodyStream(bodyBuf, errReader, resp.Header.Trailer(), 100)
+	resp.ConstructBodyStream(bodyBuf, convertClientRespStream(bodyStream, func(shouldClose bool) error {
+		assert.True(t, shouldClose)
+		return nil
+	}))
+
+	stBody := resp.BodyStream()
+	closer, _ := stBody.(io.Closer)
+	closer.Close()
 }
 
 func TestSetResponseBodyStreamFixedSize(t *testing.T) {
@@ -790,4 +819,10 @@ func TestResponseReadBodyStreamBadTrailer(t *testing.T) {
 
 	testResponseReadBodyStreamBadTrailer(t, resp, "HTTP/1.1 300 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: bar\r\n\r\n5\r\n56789\r\n0\r\ncontent-type: bar\r\n\r\n")
 	testResponseReadBodyStreamBadTrailer(t, resp, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nqwer\r\n2\r\nty\r\n0\r\nproxy-connection: bar2\r\n\r\n")
+}
+
+func TestResponseString(t *testing.T) {
+	resp := protocol.Response{}
+	resp.Header.Set("Location", "foo\r\nSet-Cookie: SESSIONID=MaliciousValue\r\n")
+	assert.True(t, strings.Contains(GetHTTP1Response(&resp).String(), "Location: foo\r\nSet-Cookie: SESSIONID=MaliciousValue\r\n"))
 }

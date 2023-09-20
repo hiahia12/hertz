@@ -80,48 +80,72 @@ type ClientIP func(ctx *RequestContext) string
 
 type ClientIPOptions struct {
 	RemoteIPHeaders []string
-	TrustedProxies  map[string]bool
+	TrustedCIDRs    []*net.IPNet
+}
+
+var defaultTrustedCIDRs = []*net.IPNet{
+	{ // 0.0.0.0/0 (IPv4)
+		IP:   net.IP{0x0, 0x0, 0x0, 0x0},
+		Mask: net.IPMask{0x0, 0x0, 0x0, 0x0},
+	},
+	{ // ::/0 (IPv6)
+		IP:   net.IP{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+		Mask: net.IPMask{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+	},
 }
 
 var defaultClientIPOptions = ClientIPOptions{
-	RemoteIPHeaders: []string{"X-Real-IP", "X-Forwarded-For"},
-	TrustedProxies: map[string]bool{
-		"0.0.0.0": true,
-	},
+	RemoteIPHeaders: []string{"X-Forwarded-For", "X-Real-IP"},
+	TrustedCIDRs:    defaultTrustedCIDRs,
 }
 
 // ClientIPWithOption used to generate custom ClientIP function and set by engine.SetClientIPFunc
 func ClientIPWithOption(opts ClientIPOptions) ClientIP {
 	return func(ctx *RequestContext) string {
 		RemoteIPHeaders := opts.RemoteIPHeaders
-		TrustedProxies := opts.TrustedProxies
+		TrustedCIDRs := opts.TrustedCIDRs
 
-		remoteIP, _, err := net.SplitHostPort(strings.TrimSpace(ctx.RemoteAddr().String()))
+		remoteIPStr, _, err := net.SplitHostPort(strings.TrimSpace(ctx.RemoteAddr().String()))
 		if err != nil {
 			return ""
 		}
-		trusted := isTrustedProxy(TrustedProxies, remoteIP)
+
+		remoteIP := net.ParseIP(remoteIPStr)
+		if remoteIP == nil {
+			return ""
+		}
+
+		trusted := isTrustedProxy(TrustedCIDRs, remoteIP)
 
 		if trusted {
 			for _, headerName := range RemoteIPHeaders {
-				ip, valid := validateHeader(TrustedProxies, ctx.Request.Header.Get(headerName))
+				ip, valid := validateHeader(TrustedCIDRs, ctx.Request.Header.Get(headerName))
 				if valid {
 					return ip
 				}
 			}
 		}
 
-		return remoteIP
+		return remoteIPStr
 	}
 }
 
-// isTrustedProxy will check whether the IP address is included in the trusted list according to TrustedProxies
-func isTrustedProxy(trustedProxies map[string]bool, remoteIP string) bool {
-	return trustedProxies[remoteIP]
+// isTrustedProxy will check whether the IP address is included in the trusted list according to trustedCIDRs
+func isTrustedProxy(trustedCIDRs []*net.IPNet, remoteIP net.IP) bool {
+	if trustedCIDRs == nil {
+		return false
+	}
+
+	for _, cidr := range trustedCIDRs {
+		if cidr.Contains(remoteIP) {
+			return true
+		}
+	}
+	return false
 }
 
 // validateHeader will parse X-Real-IP and X-Forwarded-For header and return the Initial client IP address or an untrusted IP address
-func validateHeader(trustedProxies map[string]bool, header string) (clientIP string, valid bool) {
+func validateHeader(trustedCIDRs []*net.IPNet, header string) (clientIP string, valid bool) {
 	if header == "" {
 		return "", false
 	}
@@ -135,7 +159,7 @@ func validateHeader(trustedProxies map[string]bool, header string) (clientIP str
 
 		// X-Forwarded-For is appended by proxy
 		// Check IPs in reverse order and stop when find untrusted proxy
-		if (i == 0) || (!isTrustedProxy(trustedProxies, ipStr)) {
+		if (i == 0) || (!isTrustedProxy(trustedCIDRs, ip)) {
 			return ipStr, true
 		}
 	}
@@ -754,7 +778,8 @@ func (ctx *RequestContext) ResetWithoutConn() {
 		close(ctx.finished)
 		ctx.finished = nil
 	}
-	ctx.Request.Reset()
+
+	ctx.Request.ResetWithoutConn()
 	ctx.Response.Reset()
 	if ctx.IsEnableTrace() {
 		ctx.traceInfo.Reset()
@@ -1293,4 +1318,37 @@ func (ctx *RequestContext) Bind(obj interface{}) error {
 // NOTE: obj should be a pointer.
 func (ctx *RequestContext) Validate(obj interface{}) error {
 	return binding.Validate(obj)
+}
+
+// VisitAllQueryArgs calls f for each existing query arg.
+//
+// f must not retain references to key and value after returning.
+// Make key and/or value copies if you need storing them after returning.
+func (ctx *RequestContext) VisitAllQueryArgs(f func(key, value []byte)) {
+	ctx.QueryArgs().VisitAll(f)
+}
+
+// VisitAllPostArgs calls f for each existing post arg.
+//
+// f must not retain references to key and value after returning.
+// Make key and/or value copies if you need storing them after returning.
+func (ctx *RequestContext) VisitAllPostArgs(f func(key, value []byte)) {
+	ctx.Request.PostArgs().VisitAll(f)
+}
+
+// VisitAllHeaders calls f for each request header.
+//
+// f must not retain references to key and/or value after returning.
+// Copy key and/or value contents before returning if you need retaining them.
+//
+// To get the headers in order they were received use VisitAllInOrder.
+func (ctx *RequestContext) VisitAllHeaders(f func(key, value []byte)) {
+	ctx.Request.Header.VisitAll(f)
+}
+
+// VisitAllCookie calls f for each request cookie.
+//
+// f must not retain references to key and/or value after returning.
+func (ctx *RequestContext) VisitAllCookie(f func(key, value []byte)) {
+	ctx.Request.Header.VisitAllCookie(f)
 }

@@ -18,6 +18,7 @@ package thrift
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/cloudwego/hertz/cmd/hz/config"
@@ -98,31 +99,39 @@ func astToService(ast *parser.Thrift, resolver *Resolver, args *config.Argument)
 		}
 		methods := make([]*generator.HttpMethod, 0, len(ms))
 		clientMethods := make([]*generator.ClientMethod, 0, len(ms))
+		servicePathAnno := getAnnotation(s.Annotations, ApiServicePath)
+		servicePath := ""
+		if len(servicePathAnno) > 0 {
+			servicePath = servicePathAnno[0]
+		}
 		for _, m := range ms {
 			rs := getAnnotations(m.Annotations, HttpMethodAnnotations)
-			if len(rs) > 1 {
-				return nil, fmt.Errorf("too many 'api.XXX' annotations: %s", rs)
-			}
 			if len(rs) == 0 {
 				continue
 			}
-
-			var handlerOutDir string
+			httpAnnos := httpAnnotations{}
+			for k, v := range rs {
+				httpAnnos = append(httpAnnos, httpAnnotation{
+					method: k,
+					path:   v,
+				})
+			}
+			// turn the map into a slice and sort it to make sure getting the results in the same order every time
+			sort.Sort(httpAnnos)
+			handlerOutDir := servicePath
 			genPaths := getAnnotation(m.Annotations, ApiGenPath)
-			if len(genPaths) == 0 {
-				handlerOutDir = ""
-			} else if len(genPaths) > 1 {
-				return nil, fmt.Errorf("too many 'api.handler_path' for %s", m.Name)
-			} else {
+			if len(genPaths) == 1 {
 				handlerOutDir = genPaths[0]
+			} else if len(genPaths) > 0 {
+				return nil, fmt.Errorf("too many 'api.handler_path' for %s", m.Name)
 			}
 
-			hmethod, path := util.GetFirstKV(rs)
+			hmethod, path := httpAnnos[0].method, httpAnnos[0].path
 			if len(path) != 1 || path[0] == "" {
 				return nil, fmt.Errorf("invalid api.%s  for %s.%s: %s", hmethod, s.Name, m.Name, path)
 			}
 
-			var reqName string
+			var reqName, reqRawName, reqPackage string
 			if len(m.Arguments) >= 1 {
 				if len(m.Arguments) > 1 {
 					logs.Warnf("function '%s' has more than one argument, but only the first can be used in hertz now", m.GetName())
@@ -132,25 +141,50 @@ func astToService(ast *parser.Thrift, resolver *Resolver, args *config.Argument)
 				if err != nil {
 					return nil, err
 				}
+				if strings.Contains(reqName, ".") && !m.Arguments[0].GetType().Category.IsContainerType() {
+					// If reqName contains "." , then it must be of the form "pkg.name".
+					// so reqRawName='name', reqPackage='pkg'
+					names := strings.Split(reqName, ".")
+					if len(names) != 2 {
+						return nil, fmt.Errorf("request name: %s is wrong", reqName)
+					}
+					reqRawName = names[1]
+					reqPackage = names[0]
+				}
 			}
-			var respName string
+			var respName, respRawName, respPackage string
 			if !m.Oneway {
 				var err error
 				respName, err = resolver.ResolveTypeName(m.GetFunctionType())
 				if err != nil {
 					return nil, err
 				}
+				if strings.Contains(respName, ".") && !m.GetFunctionType().Category.IsContainerType() {
+					names := strings.Split(respName, ".")
+					if len(names) != 2 {
+						return nil, fmt.Errorf("response name: %s is wrong", respName)
+					}
+					// If respName contains "." , then it must be of the form "pkg.name".
+					// so respRawName='name', respPackage='pkg'
+					respRawName = names[1]
+					respPackage = names[0]
+				}
 			}
 
 			sr, _ := util.GetFirstKV(getAnnotations(m.Annotations, SerializerTags))
 			method := &generator.HttpMethod{
-				Name:            util.CamelString(m.GetName()),
-				HTTPMethod:      hmethod,
-				RequestTypeName: reqName,
-				ReturnTypeName:  respName,
-				Path:            path[0],
-				Serializer:      sr,
-				OutputDir:       handlerOutDir,
+				Name:               util.CamelString(m.GetName()),
+				HTTPMethod:         hmethod,
+				RequestTypeName:    reqName,
+				RequestTypeRawName: reqRawName,
+				RequestTypePackage: reqPackage,
+				ReturnTypeName:     respName,
+				ReturnTypeRawName:  respRawName,
+				ReturnTypePackage:  respPackage,
+				Path:               path[0],
+				Serializer:         sr,
+				OutputDir:          handlerOutDir,
+				GenHandler:         true,
 				// Annotations:     m.Annotations,
 			}
 			refs := resolver.ExportReferred(false, true)
@@ -163,6 +197,20 @@ func astToService(ast *parser.Thrift, resolver *Resolver, args *config.Argument)
 			}
 			models.MergeMap(method.Models)
 			methods = append(methods, method)
+			for idx, anno := range httpAnnos {
+				if idx == 0 {
+					continue
+				}
+				tmp := *method
+				hmethod, path := anno.method, anno.path
+				if len(path) != 1 || path[0] == "" {
+					return nil, fmt.Errorf("invalid api.%s  for %s.%s: %s", hmethod, s.Name, m.Name, path)
+				}
+				tmp.HTTPMethod = hmethod
+				tmp.Path = path[0]
+				tmp.GenHandler = false
+				methods = append(methods, &tmp)
+			}
 			if args.CmdType == meta.CmdClient {
 				clientMethod := &generator.ClientMethod{}
 				clientMethod.HttpMethod = method
@@ -217,13 +265,13 @@ func parseAnnotationToClient(clientMethod *generator.ClientMethod, p *parser.Typ
 		}
 		if anno := getAnnotation(field.Annotations, AnnotationQuery); len(anno) > 0 {
 			hasAnnotation = true
-			query := anno[0]
+			query := checkSnakeName(anno[0])
 			clientMethod.QueryParamsCode += fmt.Sprintf("%q: req.Get%s(),\n", query, field.GoName().String())
 		}
 
 		if anno := getAnnotation(field.Annotations, AnnotationPath); len(anno) > 0 {
 			hasAnnotation = true
-			path := anno[0]
+			path := checkSnakeName(anno[0])
 			if isStringFieldType {
 				clientMethod.PathParamsCode += fmt.Sprintf("%q: req.Get%s(),\n", path, field.GoName().String())
 			} else {
@@ -233,7 +281,7 @@ func parseAnnotationToClient(clientMethod *generator.ClientMethod, p *parser.Typ
 
 		if anno := getAnnotation(field.Annotations, AnnotationHeader); len(anno) > 0 {
 			hasAnnotation = true
-			header := anno[0]
+			header := checkSnakeName(anno[0])
 			if isStringFieldType {
 				clientMethod.HeaderParamsCode += fmt.Sprintf("%q: req.Get%s(),\n", header, field.GoName().String())
 			} else {
@@ -243,7 +291,7 @@ func parseAnnotationToClient(clientMethod *generator.ClientMethod, p *parser.Typ
 
 		if anno := getAnnotation(field.Annotations, AnnotationForm); len(anno) > 0 {
 			hasAnnotation = true
-			form := anno[0]
+			form := checkSnakeName(anno[0])
 			hasFormAnnotation = true
 			if isStringFieldType {
 				clientMethod.FormValueCode += fmt.Sprintf("%q: req.Get%s(),\n", form, field.GoName().String())
@@ -259,12 +307,12 @@ func parseAnnotationToClient(clientMethod *generator.ClientMethod, p *parser.Typ
 
 		if anno := getAnnotation(field.Annotations, AnnotationFileName); len(anno) > 0 {
 			hasAnnotation = true
-			fileName := anno[0]
+			fileName := checkSnakeName(anno[0])
 			hasFormAnnotation = true
 			clientMethod.FormFileCode += fmt.Sprintf("%q: req.Get%s(),\n", fileName, field.GoName().String())
 		}
 		if !hasAnnotation && strings.EqualFold(clientMethod.HTTPMethod, "get") {
-			clientMethod.QueryParamsCode += fmt.Sprintf("%q: req.Get%s(),\n", field.GoName().String(), field.GoName().String())
+			clientMethod.QueryParamsCode += fmt.Sprintf("%q: req.Get%s(),\n", checkSnakeName(field.GoName().String()), field.GoName().String())
 		}
 	}
 	clientMethod.BodyParamsCode = meta.SetBodyParam
@@ -329,18 +377,7 @@ func getAllExtendFunction(svc *parser.Service, ast *parser.Thrift, resolver *Res
 				}
 				funcs := extendSvc.GetFunctions()
 				for _, f := range funcs {
-					// the method of other file is extended, and the package of req/resp needs to be changed
-					// ex. base.thrift -> Resp Method(Req){}
-					//					  base.Resp Method(base.Req){}
-					// todo: support container for Struct
-					if len(f.Arguments) > 0 {
-						if !strings.Contains(f.Arguments[0].Type.Name, ".") && f.Arguments[0].Type.Category.IsStruct() {
-							f.Arguments[0].Type.Name = base + "." + f.Arguments[0].Type.Name
-						}
-					}
-					if !strings.Contains(f.FunctionType.Name, ".") && f.FunctionType.Category.IsStruct() {
-						f.FunctionType.Name = base + "." + f.FunctionType.Name
-					}
+					processExtendsType(f, base)
 				}
 				extendFuncs, err := getAllExtendFunction(extendSvc, ast, resolver, args)
 				if err != nil {
@@ -368,18 +405,7 @@ func getAllExtendFunction(svc *parser.Service, ast *parser.Thrift, resolver *Res
 			if found {
 				funcs := extendSvc.GetFunctions()
 				for _, f := range funcs {
-					// the method of other file is extended, and the package of req/resp needs to be changed
-					// ex. base.thrift -> Resp Method(Req){}
-					//					  base.Resp Method(base.Req){}
-					// todo: support container for Struct
-					if len(f.Arguments) > 0 {
-						if !strings.Contains(f.Arguments[0].Type.Name, ".") && f.Arguments[0].Type.Category.IsStruct() {
-							f.Arguments[0].Type.Name = base + "." + f.Arguments[0].Type.Name
-						}
-					}
-					if !strings.Contains(f.FunctionType.Name, ".") && f.FunctionType.Category.IsStruct() {
-						f.FunctionType.Name = base + "." + f.FunctionType.Name
-					}
+					processExtendsType(f, base)
 				}
 				extendFuncs, err := getAllExtendFunction(extendSvc, refAst, resolver, args)
 				if err != nil {
@@ -392,6 +418,53 @@ func getAllExtendFunction(svc *parser.Service, ast *parser.Thrift, resolver *Res
 	}
 
 	return res, nil
+}
+
+func processExtendsType(f *parser.Function, base string) {
+	// the method of other file is extended, and the package of req/resp needs to be changed
+	// ex. base.thrift -> Resp Method(Req){}
+	//					  base.Resp Method(base.Req){}
+	if len(f.Arguments) > 0 {
+		if f.Arguments[0].Type.Category.IsContainerType() {
+			switch f.Arguments[0].Type.Category {
+			case parser.Category_Set, parser.Category_List:
+				if !strings.Contains(f.Arguments[0].Type.ValueType.Name, ".") && f.Arguments[0].Type.ValueType.Category.IsStruct() {
+					f.Arguments[0].Type.ValueType.Name = base + "." + f.Arguments[0].Type.ValueType.Name
+				}
+			case parser.Category_Map:
+				if !strings.Contains(f.Arguments[0].Type.ValueType.Name, ".") && f.Arguments[0].Type.ValueType.Category.IsStruct() {
+					f.Arguments[0].Type.ValueType.Name = base + "." + f.Arguments[0].Type.ValueType.Name
+				}
+				if !strings.Contains(f.Arguments[0].Type.KeyType.Name, ".") && f.Arguments[0].Type.KeyType.Category.IsStruct() {
+					f.Arguments[0].Type.KeyType.Name = base + "." + f.Arguments[0].Type.KeyType.Name
+				}
+			}
+		} else {
+			if !strings.Contains(f.Arguments[0].Type.Name, ".") && f.Arguments[0].Type.Category.IsStruct() {
+				f.Arguments[0].Type.Name = base + "." + f.Arguments[0].Type.Name
+			}
+		}
+	}
+
+	if f.FunctionType.Category.IsContainerType() {
+		switch f.FunctionType.Category {
+		case parser.Category_Set, parser.Category_List:
+			if !strings.Contains(f.FunctionType.ValueType.Name, ".") && f.FunctionType.ValueType.Category.IsStruct() {
+				f.FunctionType.ValueType.Name = base + "." + f.FunctionType.ValueType.Name
+			}
+		case parser.Category_Map:
+			if !strings.Contains(f.FunctionType.ValueType.Name, ".") && f.FunctionType.ValueType.Category.IsStruct() {
+				f.FunctionType.ValueType.Name = base + "." + f.FunctionType.ValueType.Name
+			}
+			if !strings.Contains(f.FunctionType.KeyType.Name, ".") && f.FunctionType.KeyType.Category.IsStruct() {
+				f.FunctionType.KeyType.Name = base + "." + f.FunctionType.KeyType.Name
+			}
+		}
+	} else {
+		if !strings.Contains(f.FunctionType.Name, ".") && f.FunctionType.Category.IsStruct() {
+			f.FunctionType.Name = base + "." + f.FunctionType.Name
+		}
+	}
 }
 
 func getUniqueResolveDependentName(name string, resolver *Resolver) string {

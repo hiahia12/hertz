@@ -19,7 +19,9 @@ package meta
 import "runtime"
 
 // Version hz version
-const Version = "v0.6.4"
+const Version = "v0.6.7"
+
+const DefaultServiceName = "hertz_service"
 
 // Mode hz run modes
 type Mode int
